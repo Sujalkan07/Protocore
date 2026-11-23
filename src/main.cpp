@@ -147,7 +147,12 @@ static void menuLoadFile() {
     std::cout << "  Enter file path: ";
 
     std::string filePath;
-    std::cin >> filePath;
+    std::getline(std::cin >> std::ws, filePath);
+
+    // Strip surrounding quotes if the user pasted/dragged a path with quotes
+    if (filePath.size() >= 2 && filePath.front() == '"' && filePath.back() == '"') {
+        filePath = filePath.substr(1, filePath.size() - 2);
+    }
 
     std::string error;
     ByteStream data;
@@ -173,7 +178,7 @@ static void menuAnalyzeStream() {
     std::cout << "             ANALYZE NETWORK STREAM\n";
     std::cout << "--------------------------------------------------------\n\n";
 
-    if (!streamLoaded || currentStream.empty()) {
+    if (!streamLoaded) {
         std::cout << "  No stream loaded. Please generate or load a stream first.\n";
         return;
     }

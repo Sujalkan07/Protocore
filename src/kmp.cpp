@@ -77,6 +77,9 @@ std::vector<size_t> kmpSearch(const uint8_t* text, size_t textLength,
     std::vector<size_t> matchedPositions;
 
     if (patternLength <= 0 || textLength == 0) {
+        if (comparisonCount != nullptr) {
+            *comparisonCount = 0;
+        }
         return matchedPositions;
     }
 
@@ -96,21 +99,18 @@ std::vector<size_t> kmpSearch(const uint8_t* text, size_t textLength,
             // Characters match — advance both
             textIndex++;
             patternIndex++;
-        }
 
-        if (patternIndex == patternLength) {
-            // Full pattern matched! Record the starting position.
-            matchedPositions.push_back(textIndex - patternLength);
+            if (patternIndex == patternLength) {
+                // Full pattern matched! Record the starting position.
+                matchedPositions.push_back(textIndex - patternLength);
 
-            // Use LPS to find next potential match (supports overlapping)
-            patternIndex = lps[patternIndex - 1];
-        }
-        else if (textIndex < textLength &&
-                 text[textIndex] != pattern[patternIndex]) {
-            // Mismatch after some matches
-            comparisons++;
+                // Use LPS to find next potential match (supports overlapping)
+                patternIndex = lps[patternIndex - 1];
+            }
+        } else {
+            // Mismatch after patternIndex matches
             if (patternIndex != 0) {
-                // Fall back in pattern using LPS (skip redundant comparisons)
+                // Fall back in pattern using LPS without advancing textIndex
                 patternIndex = lps[patternIndex - 1];
             } else {
                 // No match at all — advance text
@@ -150,6 +150,9 @@ std::vector<size_t> naiveSearch(const uint8_t* text, size_t textLength,
 
     if (patternLength <= 0 || textLength == 0 ||
         textLength < static_cast<size_t>(patternLength)) {
+        if (comparisonCount != nullptr) {
+            *comparisonCount = 0;
+        }
         return matchedPositions;
     }
 

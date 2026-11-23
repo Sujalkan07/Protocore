@@ -45,16 +45,35 @@ ByteStream buildPacket(const std::string& payloadText) {
                        static_cast<uint16_t>(payloadText.size()));
 }
 
+// ─── Reproducible PRNG for Noise Generation ─────────────────────────
+static uint32_t activeSeed = DEFAULT_GENERATOR_SEED;
+static uint32_t rngState   = DEFAULT_GENERATOR_SEED;
+
+void setGeneratorSeed(uint32_t seed) {
+    activeSeed = seed;
+    rngState   = seed;
+}
+
+static uint8_t nextRandomByte() {
+    // 32-bit Linear Congruential Generator (Knuth / Numerical Recipes)
+    rngState = rngState * 1664525u + 1013904223u;
+    return static_cast<uint8_t>((rngState >> 16) & 0xFF);
+}
+
 // ─── Helper: generate random noise bytes ────────────────────────────
+// Guarantees that the start signature AA BB CC DD is NEVER accidentally formed.
 static ByteStream generateNoise(size_t length) {
     ByteStream noise;
     noise.reserve(length);
     for (size_t i = 0; i < length; i++) {
-        // Avoid accidentally generating the start signature
-        uint8_t b = static_cast<uint8_t>(std::rand() % 256);
-        // Simple check: if we're about to form 0xAA, skip to something else
-        if (b == 0xAA && length > 3) {
-            b = 0x11;
+        uint8_t b = nextRandomByte();
+        // Check if appending this byte would form AA BB CC DD
+        if (noise.size() >= 3 &&
+            noise[noise.size() - 3] == START_SIGNATURE[0] &&
+            noise[noise.size() - 2] == START_SIGNATURE[1] &&
+            noise[noise.size() - 1] == START_SIGNATURE[2] &&
+            b == START_SIGNATURE[3]) {
+            b ^= 0x55; // Alter byte to prevent accidental signature
         }
         noise.push_back(b);
     }
@@ -180,13 +199,9 @@ static ByteStream generateMixed() {
 }
 
 // ─── Main Generator Function ────────────────────────────────────────
-ByteStream generateStream(StreamScenario scenario) {
-    // Seed the random number generator
-    static bool seeded = false;
-    if (!seeded) {
-        std::srand(static_cast<unsigned int>(std::time(nullptr)));
-        seeded = true;
-    }
+ByteStream generateStream(StreamScenario scenario, uint32_t seed) {
+    // Re-initialize RNG with the requested seed for guaranteed reproducibility
+    rngState = seed;
 
     switch (scenario) {
         case StreamScenario::NORMAL:     return generateNormal();

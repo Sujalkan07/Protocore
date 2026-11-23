@@ -24,9 +24,10 @@ bool loadBinaryFile(const std::string& filePath,
     }
 
     if (fileSize == 0) {
-        errorMessage = "File is empty: " + filePath;
+        // A 0-byte file is valid binary input with zero bytes
         output.clear();
-        return false;
+        errorMessage.clear();
+        return true;
     }
 
     // Seek back to the beginning

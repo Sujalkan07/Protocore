@@ -3,15 +3,16 @@
 #include "kmp.hpp"
 #include "crc32.hpp"
 #include <algorithm>
-#include <set>
+#include <vector>
+#include <cstdio>
 
 namespace protocore {
 
 // ═══════════════════════════════════════════════════════════════════
 // SINGLE PACKET PARSER
 // ═══════════════════════════════════════════════════════════════════
-// Attempts to parse a complete packet starting at `offset`.
-// The offset should point to the first byte of the start signature.
+// Inspects candidate packet starting at `offset`.
+// Returns a ParsedPacket with the exact classification and detail.
 
 ParsedPacket parsePacketAt(const ByteStream& stream, size_t offset) {
     ParsedPacket pkt;
@@ -23,12 +24,28 @@ ParsedPacket parsePacketAt(const ByteStream& stream, size_t offset) {
     pkt.endMarker[1] = 0;
 
     size_t streamSize = stream.size();
+
+    // ── Check: start signature available? ───────────────────────
+    if (offset + SIGNATURE_SIZE > streamSize) {
+        pkt.status = PacketStatus::INCOMPLETE;
+        pkt.statusDetail = "Stream truncated within start signature";
+        return pkt;
+    }
+
+    for (size_t i = 0; i < SIGNATURE_SIZE; i++) {
+        if (stream[offset + i] != START_SIGNATURE[i]) {
+            pkt.status = PacketStatus::MALFORMED;
+            pkt.statusDetail = "Invalid start signature bytes";
+            return pkt;
+        }
+    }
+
     size_t pos = offset + SIGNATURE_SIZE; // Move past the signature
 
-    // ── Check: enough bytes for the length field? ───────────────
+    // ── Check: enough bytes for length field? ───────────────────
     if (pos + LENGTH_FIELD_SIZE > streamSize) {
         pkt.status = PacketStatus::INCOMPLETE;
-        pkt.statusDetail = "Not enough bytes for length field";
+        pkt.statusDetail = "Stream truncated before length field complete";
         return pkt;
     }
 
@@ -38,91 +55,92 @@ ParsedPacket parsePacketAt(const ByteStream& stream, size_t offset) {
     pkt.payloadLength = payloadLength;
     pos += LENGTH_FIELD_SIZE;
 
-    // ── Calculate expected total packet size ─────────────────────
-    size_t expectedEnd = offset + PACKET_OVERHEAD + payloadLength;
-
     // ── Check: enough bytes for the complete packet? ────────────
+    size_t expectedTotalSize = PACKET_OVERHEAD + payloadLength;
+    size_t expectedEnd = offset + expectedTotalSize;
+
     if (expectedEnd > streamSize) {
         pkt.status = PacketStatus::INCOMPLETE;
         pkt.statusDetail = "Stream ends before packet is complete (need "
-                         + std::to_string(expectedEnd - offset)
+                         + std::to_string(expectedTotalSize)
                          + " bytes, have "
                          + std::to_string(streamSize - offset) + ")";
         return pkt;
     }
 
-    // ── Extract the payload ─────────────────────────────────────
+    // ── Extract payload ─────────────────────────────────────────
     pkt.payload.assign(stream.begin() + pos,
                        stream.begin() + pos + payloadLength);
     pos += payloadLength;
 
-    // ── Read the transmitted CRC (big-endian uint32) ────────────
+    // ── Read transmitted CRC (big-endian uint32) ────────────────
     pkt.expectedCRC = (static_cast<uint32_t>(stream[pos])     << 24)
                     | (static_cast<uint32_t>(stream[pos + 1]) << 16)
                     | (static_cast<uint32_t>(stream[pos + 2]) <<  8)
                     | (static_cast<uint32_t>(stream[pos + 3]));
     pos += CRC_SIZE;
 
-    // ── Read the end marker ─────────────────────────────────────
+    // ── Read end marker ─────────────────────────────────────────
     pkt.endMarker[0] = stream[pos];
     pkt.endMarker[1] = stream[pos + 1];
 
-    // ── Recalculate CRC over length + payload ───────────────────
+    // ── Recalculate CRC over length (2 bytes) + payload ─────────
     pkt.calculatedCRC = calculatePacketCRC(payloadLength,
                                            pkt.payload.data(),
                                            pkt.payload.size());
 
-    // ── Validate CRC ────────────────────────────────────────────
-    if (pkt.expectedCRC != pkt.calculatedCRC) {
-        pkt.status = PacketStatus::CRC_FAILURE;
-        pkt.statusDetail = "CRC mismatch: expected 0x"
-                         + ([](uint32_t v) {
-                               char buf[16];
-                               std::snprintf(buf, sizeof(buf), "%08X", v);
-                               return std::string(buf);
-                           })(pkt.expectedCRC)
-                         + " but calculated 0x"
-                         + ([](uint32_t v) {
-                               char buf[16];
-                               std::snprintf(buf, sizeof(buf), "%08X", v);
-                               return std::string(buf);
-                           })(pkt.calculatedCRC);
-        return pkt;
-    }
-
-    // ── Validate end marker ─────────────────────────────────────
+    // ── Step 1: Validate end marker FIRST to verify framing ──────
     if (pkt.endMarker[0] != END_MARKER[0] ||
         pkt.endMarker[1] != END_MARKER[1]) {
         pkt.status = PacketStatus::INVALID_END_MARKER;
-        pkt.statusDetail = "End marker mismatch: expected EE FF, got "
-                         + ([](uint8_t a, uint8_t b) {
-                               char buf[16];
-                               std::snprintf(buf, sizeof(buf), "%02X %02X", a, b);
-                               return std::string(buf);
-                           })(pkt.endMarker[0], pkt.endMarker[1]);
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%02X %02X", pkt.endMarker[0], pkt.endMarker[1]);
+        pkt.statusDetail = std::string("End marker mismatch: expected EE FF, got ") + buf;
         return pkt;
     }
 
-    // ── All checks passed ───────────────────────────────────────
+    // ── Step 2: Validate CRC-32 checksum ────────────────────────
+    if (pkt.expectedCRC != pkt.calculatedCRC) {
+        pkt.status = PacketStatus::CRC_FAILURE;
+        char expBuf[16], calcBuf[16];
+        std::snprintf(expBuf, sizeof(expBuf), "%08X", pkt.expectedCRC);
+        std::snprintf(calcBuf, sizeof(calcBuf), "%08X", pkt.calculatedCRC);
+        pkt.statusDetail = std::string("CRC mismatch: expected 0x") + expBuf
+                         + " but calculated 0x" + calcBuf;
+        return pkt;
+    }
+
+    // ── Step 3: All checks passed ───────────────────────────────
     pkt.status = PacketStatus::VALID;
     pkt.statusDetail = "All validations passed";
     return pkt;
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// STREAM ANALYZER
+// STREAM ANALYZER & DETERMINISTIC RECOVERY POLICY
 // ═══════════════════════════════════════════════════════════════════
 //
-// Strategy:
-// 1. Use KMP to find ALL occurrences of the start signature.
-// 2. Walk through the matches in order.
-// 3. For each match, attempt to parse a packet.
-// 4. If the packet is VALID, mark its byte range as "consumed"
-//    and skip any signature matches that fall inside it.
-// 5. If the packet is invalid (CRC failure, bad end marker),
-//    record it and move on to the next match.
-// 6. If the packet is incomplete, record it and continue.
-// 7. Any bytes not covered by a recognized packet are noise.
+// Recovery Strategy:
+// 1. Locate all candidate synchronization signatures using KMP.
+// 2. Iterate through signature positions:
+//    - If position is inside an already validated packet boundary,
+//      skip it (preserves encapsulated payload signatures).
+//    - Parse candidate at position.
+//    - If candidate claims length exceeding remaining stream:
+//      Check if any subsequent signature hit in the stream yields
+//      a VALID packet. If so, candidate had a corrupted length field
+//      (or was malformed data) -> classify as MALFORMED.
+//      Otherwise -> classify as INCOMPLETE (stream truncated at end).
+//    - If VALID: mark [start, end) as packet bytes, advance search
+//      past this packet.
+//    - If CRC_FAILURE: frame structure was verified (end marker EE FF
+//      was present), so mark [start, end) as packet bytes and advance
+//      past it to avoid parsing signatures in corrupted payload.
+//    - If INCOMPLETE: mark received bytes to end of stream as packet
+//      bytes and stop (truncated stream tail).
+//    - If INVALID_END_MARKER or MALFORMED: do NOT advance boundary.
+//      Recover by evaluating the very next signature hit.
+// 3. Noise bytes = total stream bytes - recognized packet bytes.
 
 AnalysisResult analyzeStream(const ByteStream& stream) {
     AnalysisResult result;
@@ -137,51 +155,88 @@ AnalysisResult analyzeStream(const ByteStream& stream) {
     ByteStream pattern(START_SIGNATURE.begin(), START_SIGNATURE.end());
     result.signatureHits = kmpSearch(stream, pattern);
 
-    // Track which byte ranges are consumed by valid/parsed packets
-    // We use a set of consumed byte offsets for noise calculation
-    std::set<size_t> consumedBytes;
+    if (result.signatureHits.empty()) {
+        result.noiseBytes = stream.size();
+        return result;
+    }
 
-    size_t nextValidStart = 0; // Don't re-parse inside a validated packet
+    // Boolean tracker for bytes consumed by recognized packets
+    std::vector<bool> isPacketByte(stream.size(), false);
+
+    // Helper: checks whether any signature after fromHitIdx forms a VALID packet
+    auto hasLaterValidPacket = [&](size_t fromHitIdx) -> bool {
+        for (size_t j = fromHitIdx; j < result.signatureHits.size(); j++) {
+            size_t nextSig = result.signatureHits[j];
+            ParsedPacket checkPkt = parsePacketAt(stream, nextSig);
+            if (checkPkt.status == PacketStatus::VALID) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    size_t nextValidStart = 0; // Boundary past the last accepted packet
 
     for (size_t idx = 0; idx < result.signatureHits.size(); idx++) {
         size_t sigPos = result.signatureHits[idx];
 
-        // Skip this signature if it falls inside a previously validated packet
+        // Skip signature hits that fall inside the boundary of an already validated packet
         if (sigPos < nextValidStart) {
             continue;
         }
 
-        // Step 2: Attempt to parse a packet at this position
         ParsedPacket pkt = parsePacketAt(stream, sigPos);
+
+        // Disambiguate INCOMPLETE vs MALFORMED:
+        // If candidate claims a length exceeding the stream, but subsequent signature
+        // occurrences contain a VALID packet, then this candidate's length field was
+        // corrupted (or it's malformed noise), NOT a truncated stream at the end.
+        if (pkt.status == PacketStatus::INCOMPLETE && hasLaterValidPacket(idx + 1)) {
+            pkt.status = PacketStatus::MALFORMED;
+            pkt.statusDetail = "Corrupted length field: declared length exceeds stream, followed by valid packet data";
+        }
+
         result.packets.push_back(pkt);
 
-        // Step 3: If valid, advance past this packet's boundary
         if (pkt.status == PacketStatus::VALID) {
             size_t packetEnd = sigPos + PACKET_OVERHEAD + pkt.payloadLength;
-            for (size_t b = sigPos; b < packetEnd; b++) {
-                consumedBytes.insert(b);
+            for (size_t b = sigPos; b < packetEnd && b < stream.size(); b++) {
+                isPacketByte[b] = true;
             }
             nextValidStart = packetEnd;
         }
-        else if (pkt.status == PacketStatus::CRC_FAILURE ||
-                 pkt.status == PacketStatus::INVALID_END_MARKER) {
-            // These are structurally complete but invalid packets —
-            // still mark their bytes as consumed (they're not noise)
+        else if (pkt.status == PacketStatus::CRC_FAILURE) {
+            // Intact framing (end marker matched EE FF), but CRC check failed
             size_t packetEnd = sigPos + PACKET_OVERHEAD + pkt.payloadLength;
-            for (size_t b = sigPos; b < packetEnd; b++) {
-                consumedBytes.insert(b);
+            for (size_t b = sigPos; b < packetEnd && b < stream.size(); b++) {
+                isPacketByte[b] = true;
             }
+            // For a corrupted packet with intact framing, advance past it
+            // so internal signatures in its corrupted payload are not re-parsed
+            nextValidStart = packetEnd;
         }
         else if (pkt.status == PacketStatus::INCOMPLETE) {
-            // Mark consumed from sigPos to end of stream
+            // Truly incomplete packet at the end of stream
             for (size_t b = sigPos; b < stream.size(); b++) {
-                consumedBytes.insert(b);
+                isPacketByte[b] = true;
             }
+            // Stream ends with this incomplete packet
+            break;
+        }
+        else {
+            // INVALID_END_MARKER or MALFORMED:
+            // Do NOT advance nextValidStart! Recovery policy continues search
+            // at the very next signature hit (idx + 1).
+            // Unclaimed bytes remain marked false (noise).
         }
     }
 
-    // Step 4: Calculate noise bytes
-    result.noiseBytes = stream.size() - consumedBytes.size();
+    // Calculate noise bytes (bytes not part of any recognized packet)
+    size_t noiseCount = 0;
+    for (bool b : isPacketByte) {
+        if (!b) noiseCount++;
+    }
+    result.noiseBytes = noiseCount;
 
     return result;
 }
